@@ -12,25 +12,28 @@ const state = {
   renderer: null,
   scene: null,
   stars: null,
+  // Planet seed: ?seed=123 in the URL reproduces a planet, otherwise random
+  seed: Number.parseInt(new URLSearchParams(location.search).get('seed'), 10)
+    || Math.floor(Math.random() * 1e9),
+  clock: null,
   // Gesture
   handDetected: false,
-  currentGesture: 'none', // 'none' | 'palm_zoom' | 'palm_rotate'
+  currentGesture: 'none', // 'none' | 'palm'
   // Globe transform
-  targetRotX: 0,
+  targetRotX: 0.3,
   targetRotY: 0,
   rotX: 0.3,
   rotY: 0,
-  autoRotateSpeed: 0.002,
+  autoRotateSpeed: 0.12, // rad/s
   targetZoom: 2.8,
   zoom: 2.8,
   // Mouse fallback
   isDragging: false,
   lastMouse: { x: 0, y: 0 },
-  // Palm tracking
+  // Palm tracking (exponentially smoothed to suppress landmark jitter)
+  smoothPalm: null,   // { x, y, size }
   prevPalmPos: null,
   prevPalmSize: null, // for zoom by palm distance
-  // Fist detection
-  gestureSmoothing: [],
   // MediaPipe
   hands: null,
   camera2: null, // mediapipe camera
@@ -64,6 +67,7 @@ function initScene() {
   });
   state.renderer.setSize(window.innerWidth, window.innerHeight);
   state.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  state.clock = new THREE.Clock();
   state.renderer.setClearColor(0x050510, 1);
 
   // Scene
@@ -78,6 +82,7 @@ function initScene() {
     100
   );
   state.camera.position.z = state.zoom;
+  fitCameraToViewport();
 
   // Lighting
   const ambientLight = new THREE.AmbientLight(0x4060a0, 0.5);
@@ -109,85 +114,75 @@ function initScene() {
 }
 
 // ---- Low Poly Earth ----
-function createGlobe() {
-  const detail = 4; // icosahedron detail level
-  const geometry = new THREE.IcosahedronGeometry(1, detail);
+// Terrain is driven by seeded 3D Perlin fBm so land forms coherent continents.
+// Append ?seed=123 to the URL to get the same planet every time.
+const SEA_LEVEL = 0.1;
 
-  // Displace vertices for terrain effect
+function createGlobe() {
+  const detail = 12; // r125+ subdivides linearly: 20 * (detail + 1)^2 faces ≈ 3.4k
+  const geometry = new THREE.IcosahedronGeometry(1, detail);
   const positions = geometry.attributes.position;
   const vertex = new THREE.Vector3();
 
+  const elevation = createFbm(state.seed, 5);          // continents + detail
+  const moisture = createFbm(state.seed + 1013, 3);    // deserts vs forests
+  const rand = mulberry32(state.seed + 7);
+
+  // Displace vertices: land rises above sea level, oceans stay a smooth shell.
+  // The geometry is non-indexed, but shared corners get identical positions and
+  // therefore identical noise, so the surface stays watertight.
+  const heights = new Float32Array(positions.count);
   for (let i = 0; i < positions.count; i++) {
-    vertex.fromBufferAttribute(positions, i);
-    const noise = simplex3D(vertex.x * 2, vertex.y * 2, vertex.z * 2);
-    const displacement = 1.0 + noise * 0.08;
-    vertex.normalize().multiplyScalar(displacement);
+    vertex.fromBufferAttribute(positions, i).normalize();
+    const h = elevation(vertex.x * 1.6, vertex.y * 1.6, vertex.z * 1.6);
+    heights[i] = h;
+    const radius = h > SEA_LEVEL ? 1.0 + (h - SEA_LEVEL) * 0.13 : 1.0 - 0.01;
+    vertex.multiplyScalar(radius);
     positions.setXYZ(i, vertex.x, vertex.y, vertex.z);
   }
-
   positions.needsUpdate = true;
   geometry.computeVertexNormals();
 
-  // Per-face coloring (pastel/neon palette)
-  const faceCount = positions.count / 3;
+  const palettes = {
+    deepOcean: ['#0c2d5a', '#0f3a6e', '#123f7a', '#1e3a8a', '#0c4a6e'],
+    ocean: ['#1d4ed8', '#1e40af', '#2563eb', '#0369a1', '#0284c7'],
+    shallow: ['#0ea5e9', '#38bdf8', '#22a6d6', '#3b82f6'],
+    beach: ['#fde68a', '#fcd34d', '#fef3c7'],
+    desert: ['#fbbf24', '#f59e0b', '#fcd34d', '#d97706', '#e8b04b'],
+    grass: ['#4ade80', '#86efac', '#a3e635', '#6ee7b7', '#34d399'],
+    forest: ['#16a34a', '#15803d', '#059669', '#10b981', '#22c55e'],
+    rock: ['#78716c', '#a8a29e', '#8b7d6b', '#6b7280'],
+    snow: ['#f8fafc', '#e2e8f0', '#f1f5f9', '#dbeafe', '#e0e7ff'],
+  };
+
   const colors = new Float32Array(positions.count * 3);
   const color = new THREE.Color();
-
-  // Color palettes for land and ocean
-  const oceanColors = [
-    '#1e3a5f', '#1a4b7a', '#2563eb', '#3b82f6', '#0ea5e9',
-    '#1e40af', '#1d4ed8', '#0c4a6e', '#155e75', '#164e63',
-    '#0369a1', '#0284c7', '#38bdf8',
-  ];
-  const landColors = [
-    '#34d399', '#6ee7b7', '#a7f3d0', '#86efac', '#4ade80',
-    '#a3e635', '#bef264', '#d9f99d', '#10b981', '#059669',
-    '#22c55e', '#16a34a', '#65a30d',
-  ];
-  const snowColors = ['#e2e8f0', '#f1f5f9', '#f8fafc', '#dbeafe', '#e0e7ff', '#c7d2fe'];
-  const desertColors = ['#fcd34d', '#fde68a', '#fef3c7', '#d97706', '#b45309', '#f59e0b', '#fbbf24'];
+  const c = new THREE.Vector3();
 
   for (let i = 0; i < positions.count; i += 3) {
-    // Get face centroid
-    const cx = (positions.getX(i) + positions.getX(i+1) + positions.getX(i+2)) / 3;
-    const cy = (positions.getY(i) + positions.getY(i+1) + positions.getY(i+2)) / 3;
-    const cz = (positions.getZ(i) + positions.getZ(i+1) + positions.getZ(i+2)) / 3;
-
-    const dist = Math.sqrt(cx*cx + cy*cy + cz*cz);
-    const lat = Math.asin(cy / dist);
-    const lon = Math.atan2(cz, cx);
-    const noise = simplex3D(cx * 2.5, cy * 2.5, cz * 2.5);
-    const noise2 = simplex3D(cx * 5, cy * 5, cz * 5) * 0.3;
-    const combined = noise + noise2;
+    c.set(0, 0, 0);
+    for (let j = 0; j < 3; j++) {
+      c.x += positions.getX(i + j); c.y += positions.getY(i + j); c.z += positions.getZ(i + j);
+    }
+    c.normalize();
+    const h = (heights[i] + heights[i + 1] + heights[i + 2]) / 3;
+    const lat = Math.abs(Math.asin(c.y));              // 0 (equator) .. π/2 (pole)
+    const wet = moisture(c.x * 2.2, c.y * 2.2, c.z * 2.2);
+    const cold = lat + (h > SEA_LEVEL ? (h - SEA_LEVEL) * 1.5 : 0) + wet * 0.15;
 
     let palette;
-    if (Math.abs(lat) > 1.1) {
-      // Polar caps
-      palette = snowColors;
-    } else if (Math.abs(lat) > 0.95 && combined > -0.1) {
-      // Tundra / snow edge
-      palette = Math.random() > 0.5 ? snowColors : landColors;
-    } else if (combined > 0.0) {
-      // Land (more generous threshold)
-      if (Math.abs(lat) < 0.4 && combined < 0.15) {
-        // Tropical desert belt
-        palette = desertColors;
-      } else {
-        palette = landColors;
-      }
-    } else if (combined > -0.15 && Math.abs(lat) < 0.6) {
-      // Coastal / shallow water — mixed
-      palette = Math.random() > 0.4 ? landColors : oceanColors;
-    } else {
-      // Ocean
-      palette = oceanColors;
-    }
+    if (cold > 1.3) palette = palettes.snow;                       // polar caps / peaks
+    else if (h < SEA_LEVEL - 0.22) palette = palettes.deepOcean;
+    else if (h < SEA_LEVEL - 0.07) palette = palettes.ocean;
+    else if (h < SEA_LEVEL) palette = palettes.shallow;
+    else if (h < SEA_LEVEL + 0.03) palette = palettes.beach;
+    else if (h > SEA_LEVEL + 0.38) palette = palettes.rock;
+    else if (lat < 0.55 && wet < -0.08) palette = palettes.desert;
+    else if (wet > 0.05 || h > SEA_LEVEL + 0.2) palette = palettes.forest;
+    else palette = palettes.grass;
 
-    const chosen = palette[Math.floor(Math.random() * palette.length)];
-    color.set(chosen);
-
-    // Add slight variation
-    color.offsetHSL(0, 0, (Math.random() - 0.5) * 0.08);
+    color.set(palette[Math.floor(rand() * palette.length)]);
+    color.offsetHSL(0, 0, (rand() - 0.5) * 0.06);
 
     for (let j = 0; j < 3; j++) {
       colors[(i + j) * 3] = color.r;
@@ -207,18 +202,17 @@ function createGlobe() {
   });
 
   state.globe = new THREE.Mesh(geometry, material);
-  state.globe.rotation.x = 0.3;
+  state.globe.rotation.x = state.rotX;
   state.scene.add(state.globe);
 
-  // Wireframe overlay (subtle)
+  // Wireframe overlay (subtle) — shares the globe's geometry instead of cloning it
   const wireMat = new THREE.MeshBasicMaterial({
     color: 0xffffff,
     wireframe: true,
     transparent: true,
     opacity: 0.03,
   });
-  const wireMesh = new THREE.Mesh(geometry.clone(), wireMat);
-  state.globe.add(wireMesh);
+  state.globe.add(new THREE.Mesh(geometry, wireMat));
 }
 
 // ---- Stars (Enhanced) ----
@@ -263,7 +257,7 @@ function createStarLayer(count, spread, size, opacity) {
   const starMat = new THREE.ShaderMaterial({
     uniforms: {
       uTime: { value: 0 },
-      uSize: { value: size * window.devicePixelRatio * 80 },
+      uSize: { value: size * Math.min(window.devicePixelRatio, 2) * 80 },
     },
     vertexShader: `
       attribute float aOpacity;
@@ -405,11 +399,11 @@ function createOneMeteor(index, total) {
     life: 0,
     maxLife: 0,
     active: false,
+    hue: 0.55 + Math.random() * 0.15,
     cooldown: Math.random() * 8 + index * 0.5, // staggered initial delay
   };
 
-  resetMeteor(meteor);
-  meteor.active = false; // start inactive with cooldown
+  line.visible = false; // start inactive with cooldown
   return meteor;
 }
 
@@ -431,6 +425,16 @@ function resetMeteor(m) {
   m.life = 0;
   m.maxLife = 0.6 + Math.random() * 1.0;
   m.active = true;
+
+  // Collapse the whole trail onto the spawn point so it grows out of the head
+  // instead of streaking in from wherever the previous meteor ended.
+  for (let i = 0; i < m.tailSegments; i++) {
+    m.positions[i * 3] = m.x;
+    m.positions[i * 3 + 1] = m.y;
+    m.positions[i * 3 + 2] = m.z;
+  }
+  m.mesh.geometry.attributes.position.needsUpdate = true;
+  m.mesh.visible = true;
 }
 
 function updateMeteors(dt) {
@@ -439,22 +443,14 @@ function updateMeteors(dt) {
   for (const m of state.meteors) {
     if (!m.active) {
       m.cooldown -= dt;
-      if (m.cooldown <= 0) {
-        resetMeteor(m);
-      }
-      // Hide trail
-      for (let i = 0; i < m.tailSegments; i++) {
-        m.positions[i * 3] = 0;
-        m.positions[i * 3 + 1] = -999;
-        m.positions[i * 3 + 2] = 0;
-      }
-      m.mesh.geometry.attributes.position.needsUpdate = true;
+      if (m.cooldown <= 0) resetMeteor(m);
       continue;
     }
 
     m.life += dt;
     if (m.life >= m.maxLife) {
       m.active = false;
+      m.mesh.visible = false;
       m.cooldown = 2 + Math.random() * 6;
       continue;
     }
@@ -481,9 +477,7 @@ function updateMeteors(dt) {
     const fadeOut = m.life > m.maxLife * 0.7
       ? 1.0 - (m.life - m.maxLife * 0.7) / (m.maxLife * 0.3)
       : 1.0;
-    m.mesh.material.uniforms.uColor.value.setHSL(
-      0.55 + Math.random() * 0.01, 0.6, 0.7 * fadeOut + 0.1
-    );
+    m.mesh.material.uniforms.uColor.value.setHSL(m.hue, 0.6, 0.7 * fadeOut + 0.1);
   }
 }
 
@@ -514,12 +508,71 @@ function createAtmosphere() {
   state.scene.add(atmosphere);
 }
 
-// ---- Simple 3D Noise ----
-function simplex3D(x, y, z) {
-  // Simple value noise fallback
-  const p = (Math.sin(x * 12.9898 + y * 78.233 + z * 37.719) * 43758.5453) % 1;
-  const q = (Math.sin(x * 4.898 + y * 7.23 + z * 13.72) * 23421.631) % 1;
-  return (p + q) / 2 - 0.5;
+// ---- Seeded 3D Perlin noise ----
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6D2B79F5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+const GRAD3 = [
+  [1, 1, 0], [-1, 1, 0], [1, -1, 0], [-1, -1, 0],
+  [1, 0, 1], [-1, 0, 1], [1, 0, -1], [-1, 0, -1],
+  [0, 1, 1], [0, -1, 1], [0, 1, -1], [0, -1, -1],
+];
+
+function createPerlin3D(seed) {
+  const rand = mulberry32(seed);
+  const p = Array.from({ length: 256 }, (_, i) => i);
+  for (let i = 255; i > 0; i--) {
+    const j = Math.floor(rand() * (i + 1));
+    [p[i], p[j]] = [p[j], p[i]];
+  }
+  const perm = new Uint8Array(512);
+  for (let i = 0; i < 512; i++) perm[i] = p[i & 255];
+
+  const fade = (t) => t * t * t * (t * (t * 6 - 15) + 10);
+  const lerp = (a, b, t) => a + (b - a) * t;
+  const grad = (h, x, y, z) => {
+    const g = GRAD3[h % 12];
+    return g[0] * x + g[1] * y + g[2] * z;
+  };
+
+  return (x, y, z) => {
+    const X = Math.floor(x), Y = Math.floor(y), Z = Math.floor(z);
+    x -= X; y -= Y; z -= Z;
+    const xi = X & 255, yi = Y & 255, zi = Z & 255;
+    const u = fade(x), v = fade(y), w = fade(z);
+    const A = perm[xi] + yi, AA = perm[A] + zi, AB = perm[A + 1] + zi;
+    const B = perm[xi + 1] + yi, BA = perm[B] + zi, BB = perm[B + 1] + zi;
+    return lerp(
+      lerp(lerp(grad(perm[AA], x, y, z), grad(perm[BA], x - 1, y, z), u),
+           lerp(grad(perm[AB], x, y - 1, z), grad(perm[BB], x - 1, y - 1, z), u), v),
+      lerp(lerp(grad(perm[AA + 1], x, y, z - 1), grad(perm[BA + 1], x - 1, y, z - 1), u),
+           lerp(grad(perm[AB + 1], x, y - 1, z - 1), grad(perm[BB + 1], x - 1, y - 1, z - 1), u), v),
+      w
+    );
+  };
+}
+
+// Fractal Brownian motion: layered octaves of Perlin noise, roughly in [-1, 1]
+function createFbm(seed, octaves) {
+  const noise = createPerlin3D(seed);
+  return (x, y, z) => {
+    let sum = 0, amp = 1, freq = 1, norm = 0;
+    for (let o = 0; o < octaves; o++) {
+      sum += noise(x * freq, y * freq, z * freq) * amp;
+      norm += amp;
+      amp *= 0.5;
+      freq *= 2.0;
+    }
+    return sum / norm * 1.6;
+  };
 }
 
 // ============================================================
@@ -529,18 +582,22 @@ function simplex3D(x, y, z) {
 function animate() {
   requestAnimationFrame(animate);
 
-  const time = performance.now() * 0.001; // seconds
+  // Frame-rate independent timing (same feel on 60 Hz and 120 Hz screens);
+  // dt is capped so returning to a background tab doesn't cause a jump.
+  const dt = Math.min(state.clock.getDelta(), 0.05);
+  const time = state.clock.elapsedTime;
 
   if (state.globe) {
     // Auto-rotate when no gesture
     if (!state.handDetected && !state.isDragging) {
-      state.targetRotY += state.autoRotateSpeed;
+      state.targetRotY += state.autoRotateSpeed * dt;
     }
 
-    // Smooth interpolation (lerp)
-    state.rotX += (state.targetRotX - state.rotX) * 0.08;
-    state.rotY += (state.targetRotY - state.rotY) * 0.08;
-    state.zoom += (state.targetZoom - state.zoom) * 0.08;
+    // Exponential smoothing — equivalent to lerp(0.08) per frame at 60 fps
+    const k = 1 - Math.exp(-5 * dt);
+    state.rotX += (state.targetRotX - state.rotX) * k;
+    state.rotY += (state.targetRotY - state.rotY) * k;
+    state.zoom += (state.targetZoom - state.zoom) * k;
 
     state.globe.rotation.x = state.rotX;
     state.globe.rotation.y = state.rotY;
@@ -549,7 +606,7 @@ function animate() {
     // Animate star layers — gentle rotation + twinkling
     if (state.starLayers) {
       state.starLayers.forEach((layer, idx) => {
-        const speed = 0.00008 * (idx + 1);
+        const speed = 0.0048 * (idx + 1) * dt;
         layer.rotation.y += speed;
         layer.rotation.x += speed * 0.3;
         // Update twinkle time uniform
@@ -562,18 +619,17 @@ function animate() {
     // Animate nebula clusters — slow drift
     if (state.nebulaClusters) {
       state.nebulaClusters.forEach((cluster, idx) => {
-        cluster.rotation.y += 0.00015;
+        cluster.rotation.y += 0.009 * dt;
         cluster.rotation.x = Math.sin(time * 0.1 + idx * 2) * 0.02;
       });
     }
 
     // Animate shooting stars
-    const dt = Math.min(0.05, 1 / 60); // cap delta to avoid jumps
     updateMeteors(dt);
   }
 
   // Update UI
-  const angleDeg = ((state.rotY * 180 / Math.PI) % 360).toFixed(0);
+  const angleDeg = ((((state.rotY * 180) / Math.PI) % 360 + 360) % 360).toFixed(0);
   rotationAngle.textContent = angleDeg + '°';
   zoomLevel.textContent = (2.8 / state.zoom).toFixed(1) + 'x';
 
@@ -716,8 +772,7 @@ function onHandResults(results) {
     recognizeGesture(landmarks);
   } else {
     state.handDetected = false;
-    state.prevPalmPos = null;
-    state.prevPalmSize = null;
+    resetPalmTracking();
     state.currentGesture = 'none';
     gestureType.textContent = '—';
   }
@@ -766,63 +821,91 @@ function drawHandLandmarks(ctx, landmarks) {
 //  5. GESTURE RECOGNITION
 // ============================================================
 
-function recognizeGesture(landmarks) {
-  // Key landmarks:
-  // 4 = thumb tip, 8 = index tip, 12 = middle tip
-  // 0 = wrist, 5 = index MCP, 17 = pinky MCP
+// A finger counts as extended when its tip is clearly farther from the wrist
+// than its middle (PIP) joint. Unlike comparing y-coordinates, this works no
+// matter how the hand is rotated or tilted.
+const FINGERS = [[8, 6], [12, 10], [16, 14], [20, 18]]; // [tip, pip]
 
-  const thumbTip = landmarks[4];
-  const indexTip = landmarks[8];
-  const middleTip = landmarks[12];
+function isFingerExtended(landmarks, tip, pip) {
   const wrist = landmarks[0];
+  return dist2D(wrist, landmarks[tip]) > dist2D(wrist, landmarks[pip]) * 1.1;
+}
 
-  // --- Palm size = proxy for hand-to-camera distance ---
-  // Wrist(0) to middle fingertip(12): larger = closer to camera
-  const palmSize = dist2D(wrist, middleTip);
+function resetPalmTracking() {
+  state.smoothPalm = null;
+  state.prevPalmPos = null;
+  state.prevPalmSize = null;
+}
 
-  // --- Check if hand is open (all fingers extended) ---
-  const indexExtended = landmarks[8].y < landmarks[6].y;
-  const middleExtended = landmarks[12].y < landmarks[10].y;
-  const ringExtended = landmarks[16].y < landmarks[14].y;
-  const pinkyExtended = landmarks[20].y < landmarks[18].y;
-  const allExtended = indexExtended && middleExtended && ringExtended && pinkyExtended;
+function recognizeGesture(landmarks) {
+  // Key landmarks: 0 = wrist, 5 = index MCP, 9 = middle MCP, 17 = pinky MCP
+  const allExtended = FINGERS.every(([tip, pip]) => isFingerExtended(landmarks, tip, pip));
 
-  if (allExtended) {
-    // ---- OPEN PALM: Rotate + Zoom by distance ----
-    state.currentGesture = 'palm';
-    gestureType.textContent = '🖐️ 手掌控制';
-
-    const palmX = (landmarks[0].x + landmarks[5].x + landmarks[17].x) / 3;
-    const palmY = (landmarks[0].y + landmarks[5].y + landmarks[17].y) / 3;
-
-    // Rotation: palm position
-    if (state.prevPalmPos !== null) {
-      const dx = (palmX - state.prevPalmPos.x) * 5;
-      const dy = (palmY - state.prevPalmPos.y) * 5;
-      state.targetRotY -= dx; // Mirrored because webcam is flipped
-      state.targetRotX += dy;
-      state.targetRotX = Math.max(-1.2, Math.min(1.2, state.targetRotX));
-    }
-    state.prevPalmPos = { x: palmX, y: palmY };
-
-    // Zoom: palm size (closer = bigger = zoom in)
-    if (state.prevPalmSize !== null) {
-      const delta = (palmSize - state.prevPalmSize) * 8;
-      state.targetZoom -= delta; // closer (larger) → smaller zoom value → zoom in
-      state.targetZoom = Math.max(1.5, Math.min(6, state.targetZoom));
-    }
-    state.prevPalmSize = palmSize;
-
-  } else {
+  if (!allExtended) {
     state.currentGesture = 'none';
     gestureType.textContent = '✋ 识别中…';
-    state.prevPalmPos = null;
-    state.prevPalmSize = null;
+    resetPalmTracking();
+    return;
   }
+
+  // ---- OPEN PALM: Rotate + Zoom by distance ----
+  state.currentGesture = 'palm';
+  gestureType.textContent = '🖐️ 手掌控制';
+
+  const raw = {
+    x: (landmarks[0].x + landmarks[5].x + landmarks[17].x) / 3,
+    y: (landmarks[0].y + landmarks[5].y + landmarks[17].y) / 3,
+    // Wrist → middle-finger MCP: a palm-size proxy for distance to the camera
+    // that doesn't change when the fingers bend slightly.
+    size: dist2D(landmarks[0], landmarks[9]),
+  };
+
+  // Exponential smoothing removes frame-to-frame landmark jitter
+  const a = 0.45;
+  const p = state.smoothPalm
+    ? {
+        x: state.smoothPalm.x + (raw.x - state.smoothPalm.x) * a,
+        y: state.smoothPalm.y + (raw.y - state.smoothPalm.y) * a,
+        size: state.smoothPalm.size + (raw.size - state.smoothPalm.size) * a,
+      }
+    : raw;
+  state.smoothPalm = p;
+
+  // Rotation: palm movement (ignore sub-pixel jitter)
+  if (state.prevPalmPos !== null) {
+    const dx = p.x - state.prevPalmPos.x;
+    const dy = p.y - state.prevPalmPos.y;
+    if (Math.abs(dx) > 0.001) state.targetRotY -= dx * 5; // mirrored: webcam is flipped
+    if (Math.abs(dy) > 0.001) state.targetRotX += dy * 5;
+    state.targetRotX = Math.max(-1.2, Math.min(1.2, state.targetRotX));
+  }
+  state.prevPalmPos = { x: p.x, y: p.y };
+
+  // Zoom: relative palm-size change (closer = bigger = zoom in)
+  if (state.prevPalmSize !== null && state.prevPalmSize > 0) {
+    const ratio = p.size / state.prevPalmSize - 1;
+    if (Math.abs(ratio) > 0.004) {
+      state.targetZoom -= ratio * 4;
+      state.targetZoom = Math.max(1.5, Math.min(6, state.targetZoom));
+    }
+  }
+  state.prevPalmSize = p.size;
 }
 
 function dist2D(a, b) {
   return Math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2);
+}
+
+// On portrait screens (phones) a fixed vertical FOV would crop the globe at the
+// sides, so widen the vertical FOV until the horizontal FOV matches desktop's.
+const BASE_FOV = 55;
+function fitCameraToViewport() {
+  const aspect = window.innerWidth / window.innerHeight;
+  state.camera.aspect = aspect;
+  state.camera.fov = aspect >= 1
+    ? BASE_FOV
+    : 2 * THREE.MathUtils.radToDeg(Math.atan(Math.tan(THREE.MathUtils.degToRad(BASE_FOV / 2)) / aspect));
+  state.camera.updateProjectionMatrix();
 }
 
 // ============================================================
@@ -835,10 +918,15 @@ initMouseControls();
 
 // Handle window resize
 window.addEventListener('resize', () => {
-  state.camera.aspect = window.innerWidth / window.innerHeight;
-  state.camera.updateProjectionMatrix();
+  fitCameraToViewport();
+  state.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
   state.renderer.setSize(window.innerWidth, window.innerHeight);
 });
+
+// Touch devices get touch instructions instead of mouse ones
+if (window.matchMedia('(pointer: coarse)').matches) {
+  instructionTip.querySelector('span').textContent = '也可以单指拖动旋转 · 双指捏合缩放';
+}
 
 // Start button
 startBtn.addEventListener('click', async () => {
@@ -852,7 +940,7 @@ startBtn.addEventListener('click', async () => {
     // Hide instruction tip after a while
     setTimeout(() => {
       instructionTip.style.opacity = '0';
-      instructionTip.style.transform = 'translateX(-50%) translateY(8px)';
+      instructionTip.style.transform = 'translateY(8px)';
       setTimeout(() => { instructionTip.style.display = 'none'; }, 400);
     }, 8000);
   } catch (err) {
