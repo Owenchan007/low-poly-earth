@@ -247,6 +247,7 @@ html, body {
 }
 
 .webcam-header {
+  white-space: nowrap;
   display: flex;
   align-items: center;
   gap: 6px;
@@ -425,8 +426,11 @@ html, body {
 .instruction-tip {
   position: fixed;
   bottom: var(--space-lg);
-  left: 50%;
-  transform: translateX(-50%);
+  /* Centered without transform, so the entry animation's transform can't undo it */
+  left: 0;
+  right: 0;
+  margin-inline: auto;
+  width: fit-content;
   z-index: var(--z-panels);
   display: flex;
   align-items: center;
@@ -529,5 +533,88 @@ html, body {
 
   .start-card h2 {
     font-size: 20px;
+  }
+}
+
+/* --- Phone portrait --- */
+@media (max-width: 520px) {
+  .title-bar {
+    top: calc(var(--space-md) + env(safe-area-inset-top, 0px));
+    left: max(var(--space-md), env(safe-area-inset-left, 0px));
+  }
+
+  .title-text h1 {
+    font-size: 24px;
+  }
+
+  .subtitle {
+    font-size: 12px;
+  }
+
+  /* Status becomes one compact row along the bottom edge */
+  .gesture-panel {
+    top: auto;
+    bottom: calc(var(--space-md) + env(safe-area-inset-bottom, 0px));
+    left: max(var(--space-md), env(safe-area-inset-left, 0px));
+    right: max(var(--space-md), env(safe-area-inset-right, 0px));
+    width: auto;
+    padding: var(--space-sm);
+    border-radius: var(--radius-md);
+  }
+
+  .gesture-panel .panel-header {
+    display: none;
+  }
+
+  .status-grid {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: var(--space-xs);
+  }
+
+  .status-item {
+    padding: 6px;
+    min-width: 0;
+  }
+
+  .status-label {
+    font-size: 9px;
+    letter-spacing: 0.02em;
+  }
+
+  .status-value {
+    font-size: 12px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  /* Webcam preview moves to the top-right corner, opposite the title */
+  .webcam-container {
+    top: calc(var(--space-md) + env(safe-area-inset-top, 0px));
+    bottom: auto;
+    right: max(var(--space-md), env(safe-area-inset-right, 0px));
+    width: 112px;
+    padding: 6px;
+    border-radius: var(--radius-md);
+  }
+
+  .webcam-header {
+    padding: 0 4px;
+    margin-bottom: 4px;
+    font-size: 10px;
+  }
+
+  .webcam-viewport {
+    border-radius: var(--radius-sm);
+  }
+
+  .instruction-tip {
+    bottom: calc(96px + env(safe-area-inset-bottom, 0px));
+    max-width: calc(100% - 2 * var(--space-md));
+    white-space: nowrap;
+  }
+
+  .start-card {
+    padding: var(--space-lg) var(--space-md);
   }
 }

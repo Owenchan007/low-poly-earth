@@ -82,6 +82,7 @@ function initScene() {
     100
   );
   state.camera.position.z = state.zoom;
+  fitCameraToViewport();
 
   // Lighting
   const ambientLight = new THREE.AmbientLight(0x4060a0, 0.5);
@@ -895,6 +896,18 @@ function dist2D(a, b) {
   return Math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2);
 }
 
+// On portrait screens (phones) a fixed vertical FOV would crop the globe at the
+// sides, so widen the vertical FOV until the horizontal FOV matches desktop's.
+const BASE_FOV = 55;
+function fitCameraToViewport() {
+  const aspect = window.innerWidth / window.innerHeight;
+  state.camera.aspect = aspect;
+  state.camera.fov = aspect >= 1
+    ? BASE_FOV
+    : 2 * THREE.MathUtils.radToDeg(Math.atan(Math.tan(THREE.MathUtils.degToRad(BASE_FOV / 2)) / aspect));
+  state.camera.updateProjectionMatrix();
+}
+
 // ============================================================
 //  6. STARTUP
 // ============================================================
@@ -905,11 +918,15 @@ initMouseControls();
 
 // Handle window resize
 window.addEventListener('resize', () => {
-  state.camera.aspect = window.innerWidth / window.innerHeight;
-  state.camera.updateProjectionMatrix();
+  fitCameraToViewport();
   state.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
   state.renderer.setSize(window.innerWidth, window.innerHeight);
 });
+
+// Touch devices get touch instructions instead of mouse ones
+if (window.matchMedia('(pointer: coarse)').matches) {
+  instructionTip.querySelector('span').textContent = '也可以单指拖动旋转 · 双指捏合缩放';
+}
 
 // Start button
 startBtn.addEventListener('click', async () => {
@@ -923,7 +940,7 @@ startBtn.addEventListener('click', async () => {
     // Hide instruction tip after a while
     setTimeout(() => {
       instructionTip.style.opacity = '0';
-      instructionTip.style.transform = 'translateX(-50%) translateY(8px)';
+      instructionTip.style.transform = 'translateY(8px)';
       setTimeout(() => { instructionTip.style.display = 'none'; }, 400);
     }, 8000);
   } catch (err) {
